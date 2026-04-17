@@ -341,3 +341,15 @@ ASALocalRun/
 
 # BeatPulse healthcheck temp database
 healthchecksdb
+test/
+
+# Claude Code local files
+.claude/projects/
+.claude/plans/
+.claude/settings.local.json
+
+# OpenSpec archived changes (keep active changes only)
+openspec/archive/
+
+# Pensieve memory (local only)
+.pensieve/
