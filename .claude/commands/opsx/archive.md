@@ -87,6 +87,9 @@ Archive a completed change in the experimental workflow.
    - Spec sync status (synced / sync skipped / no delta specs)
    - Note about any warnings (incomplete artifacts/tasks)
 
+7. **经验沉淀**
+   通过关键词**self-improve**触发pensieve经验沉淀
+
 **Output On Success**
 
 ```

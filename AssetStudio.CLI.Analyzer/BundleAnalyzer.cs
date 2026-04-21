@@ -129,7 +129,11 @@ namespace AssetStudio.CLI.Analyzer
                 ParseExternalsDetails(assetsManager, report);
             }
 
-            // 构建验证汇总
+            // 构建验证汇总（含间隙追踪）
+            var resSGaps = CalculateResSGaps(report, directoryInfo, nodeMapper);
+            var sfGaps = CalculateSFGaps(report, directoryInfo, nodeMapper, assetsManager);
+            report.NonResourceData.AddRange(resSGaps);
+            report.NonResourceData.AddRange(sfGaps);
             report.VerificationSummary = BuildVerificationSummary(report, bundlePath);
 
             // 更新资源数量
@@ -375,7 +379,41 @@ namespace AssetStudio.CLI.Analyzer
                 }
             }
 
+            // 修正多个 BundleResource 对同一 .resS 的重复计算
+            FixDuplicateBundleResources(result);
+
             return result;
+        }
+
+        /// <summary>
+        /// 修正多个 BundleResource 对同一 .resS 的重复计算
+        /// 仅第一个 BundleResource 声明 .resS 大小，后续设为 BundleResourceShared
+        /// </summary>
+        private void FixDuplicateBundleResources(List<ResourceInfo> resources)
+        {
+            // 按外部文件路径分组
+            var bundleResourceGroups = resources
+                .Where(r => r.DataSource == DataSourceType.BundleResource.ToString() && !string.IsNullOrEmpty(r.ExternalFilePath))
+                .GroupBy(r => r.ExternalFilePath)
+                .Where(g => g.Count() > 1);
+
+            foreach (var group in bundleResourceGroups)
+            {
+                var items = group.ToList();
+                // 第一个保留，其余设为 BundleResourceShared
+                for (int i = 1; i < items.Count; i++)
+                {
+                    items[i].DataSource = DataSourceType.BundleResourceShared.ToString();
+                    items[i].SizeUncompressed = 0;
+                    items[i].SizeCompressed = 0;
+                    items[i].BlockContributions = new List<BlockContribution>();
+                }
+
+                if (_verbose)
+                {
+                    Console.WriteLine($"[修正] {group.Key}: {items.Count} 个 BundleResource，仅首个声明 .resS 大小");
+                }
+            }
         }
 
         /// <summary>
@@ -485,6 +523,28 @@ namespace AssetStudio.CLI.Analyzer
                             uncompressedSize = 0;
                             dataOffset = 0;
                             dataSourceType = DataSourceType.ExternalMissing;
+                        }
+                        break;
+                    }
+
+                case DataSourceType.BundleResource:
+                    {
+                        // 纹理数据在同 bundle 的 .resS 文件中（m_StreamData 为零值/空）
+                        var (contribs, found, resSNode) = resourceMapper.CalculateBundleResourceCompressedSize();
+                        if (found && resSNode != null)
+                        {
+                            contributions = contribs;
+                            uncompressedSize = resSNode.size;
+                            externalFilePath = resSNode.path;
+                            dataOffset = resSNode.offset;
+                        }
+                        else
+                        {
+                            // .resS 未找到，降级为 Embedded
+                            contributions = new List<BlockContribution>();
+                            uncompressedSize = obj.byteSize;
+                            dataOffset = 0;
+                            dataSourceType = DataSourceType.Embedded;
                         }
                         break;
                     }
@@ -1053,6 +1113,263 @@ namespace AssetStudio.CLI.Analyzer
         }
 
         /// <summary>
+        /// 计算 .resS 文件中未被任何资源引用的间隙数据
+        /// </summary>
+        private List<ResourceInfo> CalculateResSGaps(
+            AnalysisReport report,
+            BundleFile.Node[] directoryInfo,
+            NodeBlockMapper nodeMapper)
+        {
+            var result = new List<ResourceInfo>();
+
+            // 找到所有 .resS Node
+            var ressNodes = directoryInfo.Where(n => n.path.EndsWith(".resS")).ToList();
+            if (ressNodes.Count == 0) return result;
+
+            foreach (var ressNode in ressNodes)
+            {
+                var ressFileName = Path.GetFileName(ressNode.path);
+                long ressSize = ressNode.size;
+                long ressOffset = ressNode.offset;
+
+                // 收集所有引用此 .resS 的资源的区间 [offset, offset+size)
+                var claimedIntervals = new List<(long Start, long End)>();
+
+                // ExternalTexture 引用
+                foreach (var res in report.Resources)
+                {
+                    if (res.DataSource == DataSourceType.ExternalTexture.ToString() ||
+                        res.DataSource == DataSourceType.ExternalAudio.ToString())
+                    {
+                        if (res.ExternalFilePath != null &&
+                            Path.GetFileName(res.ExternalFilePath) == ressFileName)
+                        {
+                            // 资源在 .resS 中的偏移和大小
+                            // DataOffset 是在 blocksStream 中的绝对位置
+                            // 相对于 .resS Node 的偏移 = DataOffset - ressNode.offset
+                            long relOffset = res.DataOffset - ressOffset;
+                            if (relOffset >= 0 && relOffset < ressSize)
+                            {
+                                long end = Math.Min(relOffset + res.SizeUncompressed, ressSize);
+                                claimedIntervals.Add((relOffset, end));
+                            }
+                        }
+                    }
+                }
+
+                // BundleResource 引用（声明整个 .resS）
+                var bundleResources = report.Resources
+                    .Where(r => r.DataSource == DataSourceType.BundleResource.ToString() &&
+                                r.ExternalFilePath != null &&
+                                Path.GetFileName(r.ExternalFilePath) == ressFileName)
+                    .ToList();
+
+                if (bundleResources.Count > 0)
+                {
+                    // BundleResource 声明了整个 .resS
+                    // 但 ExternalTexture 可能也引用了 .resS 的子区域，导致重叠
+                    // 需要将 ExternalTexture 引用的区域从 BundleResource 中扣除
+                    // 方法：将 ExternalTexture 的压缩大小从 BundleResource 的压缩大小中减去
+                    // 并将 ExternalTexture 的 DataSource 标记为重叠
+
+                    if (claimedIntervals.Count > 0)
+                    {
+                        // ExternalTexture 引用了 .resS 的部分区域
+                        // 这些区域与 BundleResource 重叠，需要从 BundleResource 中扣除
+                        foreach (var res in report.Resources)
+                        {
+                            if ((res.DataSource == DataSourceType.ExternalTexture.ToString() ||
+                                 res.DataSource == DataSourceType.ExternalAudio.ToString()) &&
+                                res.ExternalFilePath != null &&
+                                Path.GetFileName(res.ExternalFilePath) == ressFileName)
+                            {
+                                // 标记为与 BundleResource 重叠，后续在验证汇总中扣除
+                                res.DataSource = "ExternalInBundleResS";
+                            }
+                        }
+                    }
+
+                    // BundleResource 声明了整个 .resS，无间隙
+                    continue;
+                }
+
+                // 计算间隙：.resS [0, ressSize) 与已声明区间的差集
+                var gaps = CalculateIntervalGaps(claimedIntervals, 0, ressSize);
+
+                foreach (var gap in gaps)
+                {
+                    long gapSize = gap.End - gap.Start;
+                    long absStart = ressOffset + gap.Start;
+                    var contributions = nodeMapper.CalculateCompressedSize(absStart, gapSize);
+                    long compressedSize = NodeBlockMapper.SumCompressedContributions(contributions);
+
+                    result.Add(new ResourceInfo
+                    {
+                        Name = $"{ressFileName} Gap[{gap.Start}-{gap.End}]",
+                        DataCategory = DataCategory.NonResource,
+                        NonResourceType = NonResourceType.ResourceGap,
+                        TypeName = "[ResourceGap]",
+                        TypeId = -1,
+                        PathId = 0,
+                        DataSource = "ResSGap",
+                        SizeUncompressed = gapSize,
+                        SizeCompressed = compressedSize,
+                        DataOffset = absStart,
+                        ExternalFilePath = ressNode.path,
+                        InternalFileName = ressFileName,
+                        BlockContributions = contributions
+                    });
+                }
+            }
+
+            return result;
+        }
+
+        /// <summary>
+        /// 计算 SerializedFile 数据区中未被 Embedded 资源覆盖的间隙
+        /// </summary>
+        private List<ResourceInfo> CalculateSFGaps(
+            AnalysisReport report,
+            BundleFile.Node[] directoryInfo,
+            NodeBlockMapper nodeMapper,
+            AssetsManager assetsManager)
+        {
+            var result = new List<ResourceInfo>();
+            var nodeByFileName = directoryInfo.ToDictionary(n => Path.GetFileName(n.path), n => n);
+
+            foreach (var assetsFile in assetsManager.assetsFileList)
+            {
+                var fileName = assetsFile.fileName;
+                if (!nodeByFileName.TryGetValue(fileName, out var node)) continue;
+
+                // 数据区: 从 m_DataOffset 到 m_FileSize
+                long dataOffset = assetsFile.header.m_DataOffset;
+                long fileSize = assetsFile.header.m_FileSize;
+                long dataAreaSize = fileSize - dataOffset;
+
+                if (dataAreaSize <= 0) continue;
+
+                // 收集该 SF 中 Embedded 资源的 byteSize
+                // ExternalTexture/Audio 的 SizeUncompressed 是 .resS 中的大小
+                // 需要从 ObjectInfo 获取它们在 SF 中的实际 byteSize
+                var embeddedResources = report.Resources
+                    .Where(r => r.InternalFileName == fileName &&
+                                r.DataSource == DataSourceType.Embedded.ToString())
+                    .ToList();
+
+                long embeddedTotal = embeddedResources.Sum(r => r.SizeUncompressed);
+
+                // ExternalTexture/Audio 在 SF 中也有元数据占用 byteSize
+                // 从 AssetsManager 的 ObjectInfo 获取实际大小
+                var extResources = report.Resources
+                    .Where(r => r.InternalFileName == fileName &&
+                                (r.DataSource == DataSourceType.ExternalTexture.ToString() ||
+                                 r.DataSource == DataSourceType.ExternalAudio.ToString() ||
+                                 r.DataSource == "ExternalInBundleResS"))
+                    .ToList();
+
+                foreach (var extRes in extResources)
+                {
+                    var objInfo = assetsFile.m_Objects
+                        .FirstOrDefault(o => o.m_PathID == extRes.PathId);
+                    if (objInfo != null)
+                    {
+                        embeddedTotal += objInfo.byteSize;
+                    }
+                }
+
+                // 如果资源总大小小于数据区，存在间隙
+                long gapSize = dataAreaSize - embeddedTotal;
+                if (gapSize > 0)
+                {
+                    // 间隙在 blocksStream 中的位置
+                    long gapStart = node.offset + dataOffset + embeddedTotal;
+                    var contributions = nodeMapper.CalculateCompressedSize(gapStart, gapSize);
+                    long compressedSize = NodeBlockMapper.SumCompressedContributions(contributions);
+
+                    result.Add(new ResourceInfo
+                    {
+                        Name = $"{fileName} DataAreaGap",
+                        DataCategory = DataCategory.NonResource,
+                        NonResourceType = NonResourceType.ResourceGap,
+                        TypeName = "[ResourceGap]",
+                        TypeId = -1,
+                        PathId = 0,
+                        DataSource = "SFDataGap",
+                        SizeUncompressed = gapSize,
+                        SizeCompressed = compressedSize,
+                        DataOffset = gapStart,
+                        InternalFileName = fileName,
+                        BlockContributions = contributions
+                    });
+                }
+            }
+
+            return result;
+        }
+
+        /// <summary>
+        /// 计算区间差集：[rangeStart, rangeEnd) 中不在 intervals 中的部分
+        /// </summary>
+        private List<(long Start, long End)> CalculateIntervalGaps(
+            List<(long Start, long End)> intervals,
+            long rangeStart,
+            long rangeEnd)
+        {
+            if (intervals.Count == 0)
+            {
+                return new List<(long, long)> { (rangeStart, rangeEnd) };
+            }
+
+            // 合并重叠区间
+            var sorted = intervals
+                .Where(i => i.End > i.Start)
+                .OrderBy(i => i.Start)
+                .ToList();
+
+            var merged = new List<(long Start, long End)>();
+            foreach (var interval in sorted)
+            {
+                if (merged.Count == 0 || interval.Start > merged[merged.Count - 1].End)
+                {
+                    merged.Add(interval);
+                }
+                else
+                {
+                    var last = merged[merged.Count - 1];
+                    merged[merged.Count - 1] = (last.Start, Math.Max(last.End, interval.End));
+                }
+            }
+
+            // 计算差集
+            var gaps = new List<(long Start, long End)>();
+            long current = rangeStart;
+
+            foreach (var interval in merged)
+            {
+                long start = Math.Max(interval.Start, rangeStart);
+                long end = Math.Min(interval.End, rangeEnd);
+
+                if (start > current)
+                {
+                    gaps.Add((current, start));
+                }
+
+                if (end > current)
+                {
+                    current = end;
+                }
+            }
+
+            if (current < rangeEnd)
+            {
+                gaps.Add((current, rangeEnd));
+            }
+
+            return gaps;
+        }
+
+        /// <summary>
         /// 构建验证汇总
         /// 对比计算总和与文件实际大小
         /// </summary>
@@ -1134,15 +1451,45 @@ namespace AssetStudio.CLI.Analyzer
                 Percentage = actualFileSize > 0 ? (double)externals.Sum(r => r.SizeCompressed) / actualFileSize * 100 : 0
             });
 
-            // 资源数据
+            // 资源数据（排除与 BundleResource 重叠的 ExternalTexture/Audio）
+            var resourceComp = report.Resources.Sum(r => r.SizeCompressed);
+            var resourceUncomp = report.Resources.Sum(r => r.SizeUncompressed);
+
+            // ExternalInBundleResS 的数据与 BundleResource 重叠，需要扣除
+            var overlapResources = report.Resources
+                .Where(r => r.DataSource == "ExternalInBundleResS")
+                .ToList();
+            if (overlapResources.Count > 0)
+            {
+                resourceComp -= overlapResources.Sum(r => r.SizeCompressed);
+                resourceUncomp -= overlapResources.Sum(r => r.SizeUncompressed);
+            }
+
             categoryTotals.Add(new CategoryTotal
             {
                 CategoryName = "资源数据",
-                SizeUncompressed = report.Resources.Sum(r => r.SizeUncompressed),
-                SizeCompressed = report.Resources.Sum(r => r.SizeCompressed),
+                SizeUncompressed = resourceUncomp,
+                SizeCompressed = resourceComp,
                 ItemCount = report.Resources.Count,
-                Percentage = actualFileSize > 0 ? (double)report.Resources.Sum(r => r.SizeCompressed) / actualFileSize * 100 : 0
+                Percentage = actualFileSize > 0 ? (double)resourceComp / actualFileSize * 100 : 0
             });
+
+            // ResourceGap（资源间隙）
+            var resourceGaps = report.NonResourceData
+                .Where(r => r.NonResourceType == NonResourceType.ResourceGap)
+                .ToList();
+            if (resourceGaps.Count > 0)
+            {
+                categoryTotals.Add(new CategoryTotal
+                {
+                    CategoryName = "ResourceGap",
+                    NonResourceType = NonResourceType.ResourceGap,
+                    SizeUncompressed = resourceGaps.Sum(r => r.SizeUncompressed),
+                    SizeCompressed = resourceGaps.Sum(r => r.SizeCompressed),
+                    ItemCount = resourceGaps.Count,
+                    Percentage = actualFileSize > 0 ? (double)resourceGaps.Sum(r => r.SizeCompressed) / actualFileSize * 100 : 0
+                });
+            }
 
             summary.CategoryTotals = categoryTotals;
 

@@ -15,7 +15,9 @@ namespace AssetStudio.CLI.Analyzer
         ExternalTexture,    // Texture2D 数据在 .resource 文件
         ExternalAudio,      // AudioClip 数据在 .resource 文件
         ExternalVideo,      // VideoClip 数据在 .resource 文件
-        ExternalMissing     // 外部文件缺失
+        ExternalMissing,    // 外部文件缺失
+        BundleResource,     // 数据在同 bundle 内的 .resS 文件中
+        BundleResourceShared // 多个 BundleResource 共享同一 .resS，非首个声明者
     }
 
     /// <summary>
@@ -27,6 +29,7 @@ namespace AssetStudio.CLI.Analyzer
         private readonly NodeBlockMapper _nodeMapper;
         private readonly BundleFile.Node[] _nodes;
         private readonly Dictionary<string, BundleFile.Node> _nodeByFileName;
+        private readonly BundleFile.Node? _resSNode;
 
         /// <summary>
         /// 构造函数
@@ -38,6 +41,8 @@ namespace AssetStudio.CLI.Analyzer
             _nodeMapper = nodeMapper;
             _nodes = nodes;
             _nodeByFileName = nodes.ToDictionary(n => Path.GetFileName(n.path), n => n);
+            // 查找 .resS 资源文件 Node
+            _resSNode = nodes.FirstOrDefault(n => n.path.EndsWith(".resS"));
         }
 
         /// <summary>
@@ -85,10 +90,6 @@ namespace AssetStudio.CLI.Analyzer
         /// <summary>
         /// 计算外部资源的压缩大小（通用方法）
         /// </summary>
-        /// <param name="externalFileName">外部文件名</param>
-        /// <param name="dataOffset">数据在外部文件中的偏移</param>
-        /// <param name="dataSize">数据大小</param>
-        /// <returns>Block 贡献明细和是否找到外部文件</returns>
         private (List<BlockContribution> contributions, bool found, BundleFile.Node? node) CalculateExternalResourceCompressedSize(
             string externalFileName, long dataOffset, long dataSize)
         {
@@ -109,10 +110,37 @@ namespace AssetStudio.CLI.Analyzer
         }
 
         /// <summary>
+        /// 计算同 bundle .resS 文件中资源的压缩大小
+        /// 当 Texture2D 的 m_StreamData 字段为零值/空但数据实际在 .resS 中时使用
+        /// </summary>
+        /// <returns>Block 贡献明细和是否找到 .resS Node</returns>
+        public (List<BlockContribution> contributions, bool found, BundleFile.Node? node) CalculateBundleResourceCompressedSize()
+        {
+            if (_resSNode == null)
+            {
+                return (new List<BlockContribution>(), false, null);
+            }
+
+            // .resS Node 在 blocksStream 中的绝对位置
+            long absoluteStart = _resSNode.offset;
+            long size = _resSNode.size;
+
+            var contributions = _nodeMapper.CalculateCompressedSize(absoluteStart, size);
+            return (contributions, true, _resSNode);
+        }
+
+        /// <summary>
+        /// 查找同 bundle 内的 .resS Node
+        /// </summary>
+        /// <returns>.resS Node 或 null</returns>
+        public BundleFile.Node? FindResSNode()
+        {
+            return _resSNode;
+        }
+
+        /// <summary>
         /// 查找 Node 对应的内部文件名
         /// </summary>
-        /// <param name="node">Node</param>
-        /// <returns>文件名</returns>
         public string GetNodeFileName(BundleFile.Node node)
         {
             return Path.GetFileName(node.path);
@@ -121,8 +149,6 @@ namespace AssetStudio.CLI.Analyzer
         /// <summary>
         /// 查找文件名对应的 Node
         /// </summary>
-        /// <param name="fileName">文件名</param>
-        /// <returns>Node 或 null</returns>
         public BundleFile.Node? FindNodeByFileName(string fileName)
         {
             return _nodeByFileName.TryGetValue(fileName, out var node) ? node : null;
@@ -138,6 +164,12 @@ namespace AssetStudio.CLI.Analyzer
                 if (!string.IsNullOrEmpty(texture.m_StreamData?.path))
                 {
                     return DataSourceType.ExternalTexture;
+                }
+                // image_data.Size == 0 表示纹理数据不在 SerializedFile 内
+                // 可能存储在同 bundle 的 .resS 文件中
+                if (texture.image_data?.Size == 0 && texture.m_StreamData != null)
+                {
+                    return DataSourceType.BundleResource;
                 }
             }
             else if (obj is AudioClip audio)

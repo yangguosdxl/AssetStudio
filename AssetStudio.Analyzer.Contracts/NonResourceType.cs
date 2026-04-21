@@ -52,6 +52,12 @@ namespace AssetStudio.Analyzer.Contracts
         /// UserInformation 字符串
         /// 用户自定义信息
         /// </summary>
-        UserInformation
+        UserInformation,
+
+        /// <summary>
+        /// 资源间隙
+        /// .resS 文件或 SerializedFile 数据区中未被任何资源引用的数据区域
+        /// </summary>
+        ResourceGap
     }
 }

@@ -1023,6 +1023,54 @@ StreamingInfo 是 SerializedFile 中引用 ResourceFile 的结构：
 └─────────────────────────────────────────────────────────────────────────┘
 ```
 
+#### Unity 2022.3 的 StreamingInfo 零值问题
+
+在 Unity 2022.3（及部分 2021.x 版本）中，当纹理数据存储在同 bundle 内的 `.resS` 文件时，`StreamingInfo` 的所有字段可能为零值/空：
+
+```
+┌─────────────────────────────────────────────────────────────────────────┐
+│           Unity 2022.3 StreamingInfo 零值模式                            │
+├─────────────────────────────────────────────────────────────────────────┤
+│                                                                         │
+│  Texture2D 对象:                                                         │
+│    image_data_size = 0        // 纹理数据不在 SerializedFile 内          │
+│    m_StreamData = {                                                      │
+│      offset = 0              // 零值（实际从 .resS 起始位置读取）        │
+│      size = 0                // 零值（实际大小 = .resS Node.size）       │
+│      path = ''               // 空字符串（非 null）                      │
+│    }                                                                     │
+│                                                                         │
+│  实际数据位置:                                                            │
+│    同 bundle 的 DirectoryInfo 中存在 CAB-xxx.resS Node                   │
+│    Node.offset = .resS 在 blocksStream 中的起始位置                      │
+│    Node.size = .resS 文件大小（含完整 mipmap chain）                     │
+│                                                                         │
+│  影响:                                                                   │
+│    AssetStudio 核心 Texture2D 构造函数:                                  │
+│      !string.IsNullOrEmpty(m_StreamData?.path) → false                  │
+│      → 走 else 分支: ResourceReader(reader, position, 0)                │
+│      → image_data.Size = 0, 无法导出纹理                                │
+│                                                                         │
+│    AssetStudio.CLI.Analyzer:                                             │
+│      DetermineDataSourceType() 检查 m_StreamData.path 为空 → Embedded   │
+│      → 仅计入 byteSize (元数据), 遗漏 .resS 中的实际纹理数据            │
+│      → 验证误差高达 99%+                                                 │
+│                                                                         │
+│  修复方案 (已实现):                                                       │
+│    当 Texture2D.image_data.Size == 0 且 m_StreamData != null 时:         │
+│    → 判定为 BundleResource 类型                                          │
+│    → 查找同 bundle 内 .resS Node                                         │
+│    → 将 .resS 数据归属到该 Texture2D                                     │
+│    → 使用 Node.size 作为未压缩大小                                       │
+│                                                                         │
+│  验证: d1497d267.dat (Unity 2022.3.62f3)                                 │
+│    Texture2D: 2048x2048 ASTC_RGB_5x5, 12级 mipmap                       │
+│    .resS = 3,589,680 bytes = ASTC 5x5 完整 mipmap chain (精确匹配)      │
+│    修复后误差: 0.00% (57 bytes 绝对误差)                                  │
+│                                                                         │
+└─────────────────────────────────────────────────────────────────────────┘
+```
+
 #### StreamingInfo 使用示例
 
 ```

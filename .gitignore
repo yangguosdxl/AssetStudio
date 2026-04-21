@@ -353,3 +353,9 @@ openspec/archive/
 
 # Pensieve memory (local only)
 .pensieve/
+reports/
+test_batch/
+test_output/
+report2/
+report3/
+test_report/
